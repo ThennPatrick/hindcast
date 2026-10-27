@@ -72,11 +72,16 @@ async function refreshIndex() {
     // every rescan and held the result in memory for the life of the app.
     // Codex thread names live in session_index.jsonl, not the rollout, so a
     // rename moves the title without touching any signed file: sign titles.
+    // Codex subagent rollouts fold into their root session's usage without
+    // touching the root's file, so they get their own term too: a deleted
+    // or archived child must still ping.
     const sig = index.sessions
       .map((s) => s.filePath + ':' + s.mtime + ':' + s.size + ':' + s.title)
       .sort()
       .join('|')
-      + '#' + (index.skillInventory || []).map((i) => i.source + ':' + i.name).join('|');
+      + '#' + (index.skillInventory || []).map((i) => i.source + ':' + i.name).join('|')
+      + '#' + [...(index.codexChildren || new Map()).values()].flat()
+        .map((c) => c.filePath + ':' + c.mtime + ':' + c.size).sort().join('|');
     const changed = sig !== lastIndexSig;
     lastIndexSig = sig;
     // sentProgress keeps a visible progress bar from sticking; lastParsed
@@ -158,15 +163,24 @@ function createWindow() {
 // because active sessions append constantly. Only the transcript dirs are
 // watched: the rest of ~/.codex holds databases that are written nonstop.
 let watchTimer = null;
+const watched = new Set();
+function onTranscriptChange() {
+  clearTimeout(watchTimer);
+  watchTimer = setTimeout(() => refreshIndex(), 5000);
+}
+// A target that does not exist yet (Codex never run, no thread renamed yet)
+// gets its watcher on a later pass, and its arrival triggers a rescan.
 function watchProjects() {
-  const onChange = () => {
-    clearTimeout(watchTimer);
-    watchTimer = setTimeout(() => refreshIndex(), 5000);
-  };
-  for (const dir of [PROJECTS_DIR, ...CODEX_SESSION_DIRS]) {
-    try { fs.watch(dir, { recursive: true }, onChange); } catch {}
+  let added = false;
+  for (const target of [PROJECTS_DIR, ...CODEX_SESSION_DIRS, CODEX_INDEX_FILE]) {
+    if (watched.has(target)) continue;
+    try {
+      fs.watch(target, { recursive: target !== CODEX_INDEX_FILE }, onTranscriptChange);
+      watched.add(target);
+      added = true;
+    } catch {}
   }
-  try { fs.watch(CODEX_INDEX_FILE, onChange); } catch {}
+  return added;
 }
 
 const isCodex = (s) => s.agent === 'codex';
@@ -195,6 +209,7 @@ app.whenReady().then(() => {
   createWindow();
   refreshIndex();
   watchProjects();
+  setInterval(() => { if (watchProjects()) onTranscriptChange(); }, 60000);
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

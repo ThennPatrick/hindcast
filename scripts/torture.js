@@ -494,7 +494,9 @@ function writeRollout(dir, id, content) {
       empty: '', garbage: 'not json\n{ broken\n]]]', noNewline: j(cx(0, 'session_meta', { id: 'x' })),
       huge: j(cx(0, 'response_item', { type: 'function_call_output', call_id: 'q', output: 'y'.repeat(3e6) })),
       legacy: j({ id: CX_OLD_ID, timestamp: '2025-05-01T00:00:00Z', instructions: '' }, { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'pre-envelope prompt' }] }),
-      hostile: j(cx(0, 'response_item', { type: 'message', role: 'user', content: 'not an array' }), cx(1, 'response_item', { type: 'function_call', name: null, arguments: 5 }), cx(2, 'response_item', { type: 'reasoning', summary: 'x', content: {} }), cx(3, 'token_usage_record', { response_id: 'r', usage: 'nope' })),
+      hostile: j({ timestamp: { toString: 'invalid' }, type: 'token_usage_record', payload: { response_id: 'r', usage: { output_tokens: 1 } } },
+        { timestamp: { toString: 'invalid' }, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'survives' }] } },
+        cx(0, 'response_item', { type: 'message', role: 'user', content: 'not an array' }), cx(1, 'response_item', { type: 'function_call', name: null, arguments: 5 }), cx(2, 'response_item', { type: 'reasoning', summary: 'x', content: {} }), cx(3, 'token_usage_record', { response_id: 'r', usage: 'nope' })),
     };
     for (const [name, content] of Object.entries(cases)) {
       const fp = writeRollout(path.join(DIR, 'cx-bad'), '01a1ffff-0000-7000-8000-0000000000' + String(Object.keys(cases).indexOf(name)).padStart(2, '0'), content);
@@ -502,7 +504,47 @@ function writeRollout(dir, id, content) {
       const r = await codex.parseCodexSession(fp);
       if (typeof m.title !== 'string' || !Array.isArray(r.events)) throw new Error(name + ': bad shape');
       if (name === 'legacy' && (m.userTurns !== 1 || m.threadId !== CX_OLD_ID)) throw new Error('legacy rollout not read: ' + JSON.stringify(m).slice(0, 200));
+      if (name === 'hostile' && !r.events.some((e) => e.text === 'survives')) throw new Error('an object timestamp took the rest of the rollout with it');
     }
+  });
+  await check('codex: usage a subagent replays from its parent at creation is not counted', async () => {
+    const born = new Date(2026, 9, 2, 9, 0, 0).toISOString();
+    const later = new Date(2026, 9, 2, 9, 0, 5).toISOString();
+    const id = '01a10000-0000-7000-8000-0000000000d1';
+    const rollout = j(
+      { timestamp: born, type: 'session_meta', payload: { id, session_id: CX_ID, parent_thread_id: CX_ID, forked_from_id: CX_ID, source: { subagent: { thread_spawn: { parent_thread_id: CX_ID } } } } },
+      { timestamp: born, type: 'turn_context', payload: { turn_id: 'parent-turn', model: 'gpt-6-luna' } },
+      { timestamp: born, type: 'event_msg', payload: { type: 'task_started', turn_id: 'parent-turn' } },
+      { timestamp: born, type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { total_tokens: 5000 }, last_token_usage: { input_tokens: 900, output_tokens: 90 } } } },
+      { timestamp: born, type: 'token_usage_record', payload: { turn_id: 'parent-turn', response_id: 'resp_parent', usage: { input_tokens: 900, output_tokens: 90 } } },
+      { timestamp: later, type: 'event_msg', payload: { type: 'task_started', turn_id: 'own' } },
+      { timestamp: later, type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'own work' }] } },
+      { timestamp: later, type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { total_tokens: 5110 }, last_token_usage: { input_tokens: 100, output_tokens: 10 } } } }
+    );
+    const m = await codex.extractCodexMeta(writeRollout(path.join(DIR, 'cx-replay'), id, rollout));
+    const { aggregateRecords } = require('../lib/scanner');
+    const { tokens } = aggregateRecords(m.usageRecords);
+    if (tokens.output !== 10 || tokens.input !== 100) throw new Error('replayed usage counted: ' + JSON.stringify(tokens));
+  });
+  await check('codex: an over-long line is skipped but keeps its line number', async () => {
+    const fp = path.join(DIR, 'cx-long', 'rollout-2026-10-01T10-00-00-01a10000-0000-7000-8000-0000000000e1.jsonl');
+    fs.mkdirSync(path.dirname(fp), { recursive: true });
+    const fd = fs.openSync(fp, 'w');
+    fs.writeSync(fd, JSON.stringify(cx(0, 'session_meta', { id: '01a10000-0000-7000-8000-0000000000e1', cwd: '/x' })) + '\n');
+    const block = Buffer.alloc(8 * 1024 * 1024, 120); // 'x' with no newline: one 72 MB line
+    for (let i = 0; i < 9; i++) fs.writeSync(fd, block);
+    fs.writeSync(fd, '\n' + JSON.stringify(cx(1, 'response_item', { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'after the long line' }] })) + '\n');
+    fs.closeSync(fd);
+    const m = await codex.extractCodexMeta(fp);
+    const r = await codex.parseCodexSession(fp);
+    fs.rmSync(fp);
+    if (m.userTurns !== 1 || m.events !== 2) throw new Error('meta: ' + JSON.stringify({ u: m.userTurns, e: m.events }));
+    if (r.events.length !== 1 || r.events[0].uuid !== 'L3') throw new Error('tape: ' + JSON.stringify(r.events.map((e) => e.uuid)));
+  });
+  await check('codex: only snake_case context wrappers count as injected', async () => {
+    const cases = [['<environment_context>\n<cwd>/x</cwd>\n</environment_context>', true], ['<recommended_plugins>x</recommended_plugins>', true],
+      ['# AGENTS.md instructions for /x', true], ['<request>Review this code</request>', false], ['<div>broken</div>', false], ['plain prompt', false]];
+    for (const [text, want] of cases) if (codex.isInjectedText(text) !== want) throw new Error(JSON.stringify(text) + ' should be ' + want);
   });
   await check('codex: .jsonl.zst reads the same as plain', async () => {
     if (!codex.zstdBin()) return; // zstd not installed: compressed rollouts are skipped, nothing to compare
