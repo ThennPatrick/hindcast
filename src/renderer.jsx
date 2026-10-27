@@ -2,7 +2,7 @@ import React, { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallba
 import { createRoot } from 'react-dom/client';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
-import { costOf } from '../lib/pricing.js';
+import { costOf, providerOf, PROVIDER_LABELS } from '../lib/pricing.js';
 import { buildResumeCmd } from '../lib/resume.js';
 import { BUILTIN_COMMANDS, BUNDLED_SKILLS } from '../lib/builtin-commands.js';
 
@@ -266,12 +266,32 @@ function FilterBar({ dateFilter, setDateFilter, modelFilter, setModelFilter, mod
     }
   }
 
+  // Provider rows select or clear every model of that provider in scope.
+  const providerGroups = useMemo(() => {
+    const groups = new Map();
+    for (const o of modelOptions) {
+      const key = providerOf(o.id);
+      const g = groups.get(key) || { key, label: PROVIDER_LABELS[key], ids: [] };
+      g.ids.push(o.id);
+      groups.set(key, g);
+    }
+    return [...groups.values()];
+  }, [modelOptions]);
+  const groupState = (g) => {
+    const n = g.ids.filter((id) => modelFilter.has(id)).length;
+    return n === 0 ? 'none' : n === g.ids.length ? 'all' : 'some';
+  };
+  const exactGroup = providerGroups.find((g) =>
+    g.ids.length > 1 && g.ids.length === modelFilter.size && groupState(g) === 'all');
+
   const modelActive = modelFilter.size > 0;
   const modelLabel = !modelActive
     ? 'Model'
-    : modelFilter.size === 1
-      ? modelShort([...modelFilter][0])
-      : `${modelFilter.size} models`;
+    : exactGroup
+      ? `${exactGroup.label} models`
+      : modelFilter.size === 1
+        ? modelShort([...modelFilter][0])
+        : `${modelFilter.size} models`;
 
   return (
     <div className="filter-row">
@@ -313,6 +333,25 @@ function FilterBar({ dateFilter, setDateFilter, modelFilter, setModelFilter, mod
         open={openWhich === 'model'} setOpen={(v) => setOpenWhich(v ? 'model' : null)}
       >
         {modelOptions.length === 0 && <div className="dd-empty">no models in scope</div>}
+        {modelOptions.length > 1 && providerGroups.map((g) => {
+          const st = groupState(g);
+          return (
+            <div
+              key={'p:' + g.key}
+              className={'dd-item dd-provider' + (st === 'all' ? ' on' : '')}
+              onClick={() => {
+                const next = new Set(modelFilter);
+                for (const id of g.ids) { if (st === 'all') next.delete(id); else next.add(id); }
+                setModelFilter(next);
+              }}
+            >
+              <span className="dd-check">{st === 'all' ? '✓' : st === 'some' ? '◐' : '○'}</span>
+              <span className="dd-name">All {g.label}</span>
+              <span className="dd-count">{g.ids.length} model{g.ids.length === 1 ? '' : 's'}</span>
+            </div>
+          );
+        })}
+        {modelOptions.length > 1 && <div className="dd-sep" />}
         {modelOptions.map(({ id, name, count }) => {
           const on = modelFilter.has(id);
           return (
@@ -651,12 +690,27 @@ const dayKeyOf = (ts) => {
   return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
 };
 
+// Roll per-model {model, cost, out} entries up to providers. Cost stays null
+// for a provider none of whose models has a known price.
+function byProvider(entries) {
+  const acc = new Map();
+  for (const e of entries) {
+    const key = providerOf(e.model);
+    const p = acc.get(key) || { key, label: PROVIDER_LABELS[key], cost: null, out: 0 };
+    if (e.cost != null) p.cost = (p.cost || 0) + e.cost;
+    p.out += e.out;
+    acc.set(key, p);
+  }
+  return [...acc.values()].sort((a, b) => ((b.cost || 0) - (a.cost || 0)) || (b.out - a.out));
+}
+
 function Ledger({ sessions, dayInRange, modelFilter }) {
   const [group, setGroup] = useState('day');
+  const [by, setBy] = useState('model'); // breakdown and table chips: 'model' | 'provider'
   const dayOk = dayInRange || (() => true);
   const modelOk = (m) => !modelFilter || modelFilter.size === 0 || modelFilter.has(m);
 
-  const { rows, models, totals } = useMemo(() => {
+  const { rows, models, providers, totals } = useMemo(() => {
     // period -> model -> {in,out,cr,w5,w1}; plus per-period session counts
     const byPeriod = new Map();
     const perModel = new Map();
@@ -699,6 +753,7 @@ function Ledger({ sessions, dayInRange, modelFilter }) {
           cost: priced ? cost : null,
           tin, tout, tcr, tcw,
           models: perModelRow,
+          providers: byProvider(perModelRow),
           sessions: sessionsInPeriod.get(key) || 0,
         };
       });
@@ -706,6 +761,7 @@ function Ledger({ sessions, dayInRange, modelFilter }) {
     const models = [...perModel.entries()]
       .map(([model, u]) => ({ model, u, cost: costOf(model, u) }))
       .sort((a, b) => (b.cost || 0) - (a.cost || 0));
+    const providers = byProvider(models.map((m) => ({ model: m.model, cost: m.cost, out: m.u.out })));
 
     const activeDays = new Set();
     for (const s of sessions) {
@@ -717,7 +773,7 @@ function Ledger({ sessions, dayInRange, modelFilter }) {
       cr: models.reduce((a, m) => a + m.u.cr, 0),
       days: activeDays.size,
     };
-    return { rows, models, totals };
+    return { rows, models, providers, totals };
   }, [sessions, group, dayInRange, modelFilter]);
 
   const last7 = useMemo(() => {
@@ -764,12 +820,25 @@ function Ledger({ sessions, dayInRange, modelFilter }) {
       </div>
 
       <div className="archive-section">
-        <h3>By model</h3>
-        <BarList items={models.map((m) => ({
-          label: modelShort(m.model),
-          value: m.cost || 0,
-          display: `${fmtUSD(m.cost)} · ${fmtTokens(m.u.out)} out`,
-        }))} color="var(--brass-dim)" />
+        <h3>
+          By {by}
+          <span className="ledger-groups">
+            {['model', 'provider'].map((b) => (
+              <button key={b} className={by === b ? 'on' : ''} onClick={() => setBy(b)}>{b}</button>
+            ))}
+          </span>
+        </h3>
+        <BarList items={by === 'provider'
+          ? providers.map((p) => ({
+              label: p.label,
+              value: p.cost || 0,
+              display: `${fmtUSD(p.cost)} · ${fmtTokens(p.out)} out`,
+            }))
+          : models.map((m) => ({
+              label: modelShort(m.model),
+              value: m.cost || 0,
+              display: `${fmtUSD(m.cost)} · ${fmtTokens(m.u.out)} out`,
+            }))} color="var(--brass-dim)" />
       </div>
 
       <div className="archive-section">
@@ -784,20 +853,27 @@ function Ledger({ sessions, dayInRange, modelFilter }) {
         <div className="ledger-table-wrap">
           <table className="ledger-table">
             <thead><tr>
-              <th className="l">{group}</th><th className="l">models</th>
+              <th className="l">{group}</th><th className="l">{by === 'provider' ? 'providers' : 'models'}</th>
               <th>sessions</th><th>in</th><th>out</th><th>cache r</th><th>cache w</th><th>est. cost</th><th></th>
             </tr></thead>
             <tbody>
               {rows.slice(0, 90).map((r) => (
                 <tr key={r.key}>
                   <td className="l period">{r.label}</td>
-                  <td className="l models">
-                    {r.models.slice(0, 4).map((m) => (
-                      <span key={m.model} className="model-chip" title={`${m.model}: ${fmtUSD(m.cost)}`}>
-                        {modelShort(m.model)}
-                      </span>
-                    ))}
-                    {r.models.length > 4 && <span className="model-chip">+{r.models.length - 4}</span>}
+                  <td
+                    className={'l models' + (by === 'provider' ? ' providers' : '')}
+                    title={by === 'provider' ? r.providers.map((p) => `${p.label} ${fmtUSD(p.cost)}`).join(' · ') : undefined}
+                  >
+                    {by === 'provider'
+                      ? r.providers.map((p) => <span key={p.key} className="model-chip">{p.label}</span>)
+                      : <>
+                          {r.models.slice(0, 4).map((m) => (
+                            <span key={m.model} className="model-chip" title={`${m.model}: ${fmtUSD(m.cost)}`}>
+                              {modelShort(m.model)}
+                            </span>
+                          ))}
+                          {r.models.length > 4 && <span className="model-chip">+{r.models.length - 4}</span>}
+                        </>}
                   </td>
                   <td>{r.sessions}</td>
                   <td>{fmtTokens(r.tin)}</td>
@@ -819,9 +895,11 @@ function Ledger({ sessions, dayInRange, modelFilter }) {
       <div className="archive-section">
         <h3>Method</h3>
         <p className="ledger-method">
-          Cost = input + output at each model's published $/MTok, cache reads at 0.1×, cache
-          writes at 1.25× (5-minute) and 2× (1-hour) input rate. Usage is deduplicated by API
-          message id. Models without a known price are counted in tokens but excluded from cost.
+          Cost = input + output at each model's published $/MTok, cache reads at 0.1× input
+          (OpenAI models at their own published cached-input rate), cache writes at 1.25×
+          (5-minute) and 2× (1-hour) input rate. Long-context surcharges are not applied. Usage
+          is deduplicated by API message id. Models without a known price are
+          counted in tokens but excluded from cost.
         </p>
       </div>
     </div>
