@@ -251,7 +251,7 @@ function Dropdown({ label, active, open, setOpen, children }) {
   );
 }
 
-function FilterBar({ dateFilter, setDateFilter, modelFilter, setModelFilter, modelOptions }) {
+function FilterBar({ dateFilter, setDateFilter, modelFilter, setModelFilter, modelOptions, usageModels }) {
   const [openWhich, setOpenWhich] = useState(null);
 
   const dateActive = dateFilter.preset !== 'all';
@@ -266,17 +266,20 @@ function FilterBar({ dateFilter, setDateFilter, modelFilter, setModelFilter, mod
     }
   }
 
-  // Provider rows select or clear every model of that provider in scope.
+  // Provider rows select or clear every model of that provider in scope,
+  // including models that only subagents used: those never reach
+  // s.models, so they have no row of their own, but the Ledger counts them.
   const providerGroups = useMemo(() => {
     const groups = new Map();
-    for (const o of modelOptions) {
-      const key = providerOf(o.id);
+    const ids = new Set([...modelOptions.map((o) => o.id), ...(usageModels || [])]);
+    for (const id of ids) {
+      const key = providerOf(id);
       const g = groups.get(key) || { key, label: PROVIDER_LABELS[key], ids: [] };
-      g.ids.push(o.id);
+      g.ids.push(id);
       groups.set(key, g);
     }
     return [...groups.values()];
-  }, [modelOptions]);
+  }, [modelOptions, usageModels]);
   const groupState = (g) => {
     const n = g.ids.filter((id) => modelFilter.has(id)).length;
     return n === 0 ? 'none' : n === g.ids.length ? 'all' : 'some';
@@ -2017,6 +2020,15 @@ function App() {
     for (const o of opts) if (nameCounts[o.name] > 1) o.name = o.id;
     return opts;
   }, [dateScoped]);
+  // Every model with usage in scope, subagents included, for the provider
+  // rows in the filter.
+  const usageModels = useMemo(() => {
+    const ids = new Set();
+    for (const s of dateScoped) {
+      for (const day of Object.values(s.daily || {})) for (const m of Object.keys(day)) ids.add(m);
+    }
+    return [...ids];
+  }, [dateScoped]);
   const filteredSessions = useMemo(() => {
     if (!modelFilter.size) return dateScoped;
     return dateScoped.filter((s) => Object.keys(s.models).some((m) => modelFilter.has(m)));
@@ -2108,6 +2120,7 @@ function App() {
             dateFilter={dateFilter} setDateFilter={setDateFilter}
             modelFilter={modelFilter} setModelFilter={setModelFilter}
             modelOptions={modelOptions}
+            usageModels={usageModels}
           />
         }
       />

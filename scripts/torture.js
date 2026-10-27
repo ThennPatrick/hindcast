@@ -363,7 +363,9 @@ const SKILL_FORK = SKILL_PARENT + '\n' + j(
   });
   await check('pricing: provider classification', async () => {
     const { providerOf } = require('../lib/pricing');
+    if (priceFor('global.anthropic.claude-sonnet-4-5-20250929-v1:0').input !== 3) throw new Error('global Bedrock id unpriced');
     const want = { 'claude-opus-4-8': 'anthropic', 'us.anthropic.claude-opus-4-8-v1:0': 'anthropic', 'anthropic.claude-3-haiku': 'anthropic',
+      'global.anthropic.claude-sonnet-4-5-20250929-v1:0': 'anthropic',
       'gpt-6.1-sol': 'openai', 'codex-auto-review': 'openai', 'o3': 'openai', 'gpt-daybreak-blue-latest': 'openai',
       'gemini-3-pro': 'other', '': 'other', null: 'other' };
     for (const [id, p] of Object.entries(want)) {
